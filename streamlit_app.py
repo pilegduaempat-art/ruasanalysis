@@ -35,15 +35,85 @@ def get_ohlcv(symbol, timeframe="15m", limit=1000):
     df["time"] = pd.to_datetime(df["time"], unit="ms")
     return df
 
-def get_top_volatile_pairs(limit=30):
-    tickers = exchange.fetch_tickers()
-    df = pd.DataFrame([
-        (s, t["quoteVolume"], t["percentage"])
-        for s,t in tickers.items() if s.endswith("USDT")
-    ], columns=["symbol","volume","change"])
-    df = df.sort_values("volume", ascending=False).head(30)
-    df = df.sort_values("change", key=lambda x: abs(x), ascending=False).head(limit)
-    return df["symbol"].tolist()
+import aiohttp
+import asyncio
+import math
+import logging
+
+logger = logging.getLogger(__name__)
+
+async def fetch_json_with_retries(session, url, params=None, retries=3, backoff=1.0, timeout=10):
+    for attempt in range(1, retries+1):
+        try:
+            async with session.get(url, params=params, timeout=timeout) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as e:
+            logger.warning(f"Request failed ({attempt}/{retries}) {url} → {e}")
+            if attempt == retries:
+                raise
+            await asyncio.sleep(backoff * attempt)
+
+class VolatilityScanner:
+    BASE_URL = "https://fapi.binance.com"
+
+    def __init__(self):
+        # nothing to init for REST fallback
+        pass
+
+    async def get_top_volatile_pairs(self, limit: int = 10) -> list:
+        """
+        Fallback implementation using Binance public REST endpoints (no ccxt).
+        Returns list of dicts: symbol, price, change_24h, high_24h, low_24h, volume, volatility_score
+        """
+        try:
+            async with aiohttp.ClientSession(headers={"User-Agent": "RUAS-Scanner/1.0"}) as session:
+                # 1) exchangeInfo to filter active perpetual USDT symbols
+                info_url = f"{self.BASE_URL}/fapi/v1/exchangeInfo"
+                info = await fetch_json_with_retries(session, info_url, retries=3, backoff=1.2)
+                valid_symbols = {
+                    s['symbol'] for s in info.get('symbols', [])
+                    if s.get('status') == 'TRADING' and s.get('symbol', '').endswith('USDT') and s.get('contractType') == 'PERPETUAL'
+                }
+
+                # 2) ticker 24hr (returns list)
+                tickers_url = f"{self.BASE_URL}/fapi/v1/ticker/24hr"
+                tickers = await fetch_json_with_retries(session, tickers_url, retries=3, backoff=1.2)
+
+                volatility_data = []
+                for t in tickers:
+                    sym = t.get('symbol')
+                    if sym not in valid_symbols:
+                        continue
+                    try:
+                        price_change = float(t.get('priceChangePercent', 0))
+                        high_price = float(t.get('highPrice', 0))
+                        low_price = float(t.get('lowPrice', 0))
+                        last_price = float(t.get('lastPrice', 0))
+                        volume = float(t.get('volume', 0))
+
+                        true_range = ((high_price - low_price) / low_price * 100) if low_price > 0 else 0.0
+                        volatility_score = abs(price_change) * 0.6 + true_range * 0.4
+
+                        volatility_data.append({
+                            'symbol': sym,
+                            'price': last_price,
+                            'change_24h': price_change,
+                            'high_24h': high_price,
+                            'low_24h': low_price,
+                            'volume': volume,
+                            'volatility_score': volatility_score
+                        })
+                    except Exception:
+                        continue
+
+                volatility_data.sort(key=lambda x: x['volatility_score'], reverse=True)
+                return volatility_data[:limit]
+
+        except Exception as e:
+            logger.error(f"Fallback REST get_top_volatile_pairs failed: {e}")
+            return []
+
 
 # -----------------------------
 # Analisis Teknis Komprehensif

@@ -1,8 +1,6 @@
-streamlit>=1.26
-aiohttp
+streamlit
+ccxt
 pandas
 numpy
+requests
 plotly
-python-dotenv
-ccxt
-
